@@ -85,4 +85,14 @@ export const notificationService = {
   sendRoleAssignedNotice: (data) => api.post('/notifications/role-assigned', data),
 }
 
+// Provisioning / Admin helpers (backend using Supabase service role key).
+export const provisionService = {
+  createAuthUser: (data) => api.post('/provision/auth-user', data),
+}
+
+export const planningShareService = {
+  shareAnnualPlanning: (data) => api.post('/notifications/share-planning', data),
+  shareAnnualPlanningPdf: (data) => api.post('/notifications/share-planning-pdf', data),
+}
+
 export default api

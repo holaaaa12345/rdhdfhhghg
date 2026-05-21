@@ -179,7 +179,18 @@ export function Attendance({ showToast, onNavigate }) {
         },
       })
 
-      doc.save(`Asistencia_${course.replace(/ /g, '_')}_${date}.pdf`)
+      const fileName = `Asistencia_${course.replace(/ /g, '_')}_${date}.pdf`
+
+      // Use an explicit Blob download for better compatibility than `doc.save(...)`.
+      const blob = doc.output('blob')
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = fileName
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
       showToast('success', 'PDF de asistencia descargado')
     } catch (error) {
       console.error(error)

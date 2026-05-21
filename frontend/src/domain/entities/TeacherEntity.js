@@ -6,6 +6,14 @@ const splitSubjects = (value = '') =>
     .map(item => item.trim())
     .filter(Boolean)
 
+// We keep phone as a string (to preserve leading zeros), but restrict it to digits.
+// Dominican phone numbers are commonly 8-10 digits, so we cap to 10.
+const MAX_TEACHER_PHONE_DIGITS = 10
+const sanitizeTeacherPhone = (value = '') =>
+  String(value || '')
+    .replace(/\D/g, '')
+    .slice(0, MAX_TEACHER_PHONE_DIGITS)
+
 export class TeacherEntity extends BaseEntity {
   constructor(data = {}) {
     super({
@@ -37,7 +45,7 @@ export class TeacherEntity extends BaseEntity {
     return {
       name: String(normalized.nombre || normalized.name || '').trim(),
       email: String(normalized.correo || normalized.email || '').trim(),
-      phone: String(normalized.telefono || normalized.phone || '').trim(),
+      phone: sanitizeTeacherPhone(normalized.telefono || normalized.phone || ''),
       subjects: splitSubjects(subjects).join(', '),
       status: String(normalized.estado || normalized.status || 'active').toLowerCase() === 'inactive'
         ? 'inactive'
@@ -49,7 +57,7 @@ export class TeacherEntity extends BaseEntity {
     return new TeacherEntity({
       name: String(data.name || '').trim(),
       email: String(data.email || '').trim(),
-      phone: String(data.phone || '').trim(),
+      phone: sanitizeTeacherPhone(data.phone || ''),
       subjects: subjectList.join(', '),
       subjectList,
       status: data.status || 'active',

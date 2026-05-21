@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routes import auth, users, dashboard, courses, notifications
+from app.routes import auth, users, dashboard, courses, notifications, provision
 
 # Punto de entrada del backend (API).
 # Esta app expone endpoints HTTP que consume el frontend.
@@ -36,6 +36,7 @@ app.include_router(users.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(courses.router, prefix="/api")
 app.include_router(notifications.router, prefix="/api")
+app.include_router(provision.router, prefix="/api")
 
 # ── Health check ──────────────────────────────────────────────
 # Health check: endpoint simple para confirmar que el backend esta encendido.

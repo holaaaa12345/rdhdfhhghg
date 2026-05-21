@@ -22,3 +22,28 @@ class EmailNotificationResponse(BaseModel):
     ok: bool
     message: str
     sent_count: int = 0
+
+
+# Request: compartir/mandar una planificacion (matriz) por correo a Coordinador/Director.
+class PlanningShareRequest(BaseModel):
+    plan_type: str = "annual"
+    subject: str
+    course: str
+    year: int
+    plan_kind: str = "Tecnica"  # Tecnica o Academica (segun el centro)
+    module_name: str = ""
+    module_code: str = ""
+    uc_code: str = ""
+    uc_title: str = ""
+    ra_title: str = ""
+    ra_domain: str = ""
+    shared_by_name: str = ""
+    shared_by_email: Optional[EmailStr] = None
+    # Link para abrir en la app (si aplica)
+    app_link: Optional[str] = None
+
+
+class PlanningSharePdfRequest(PlanningShareRequest):
+    # PDF generado en frontend (base64). Se envia como adjunto en el correo.
+    pdf_base64: str
+    filename: str = "planificacion.pdf"

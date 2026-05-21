@@ -64,6 +64,7 @@ class SMTPEmailService:
         subject: str,
         html_body: str,
         text_body: Optional[str] = None,
+        attachments: Optional[list[dict]] = None,
     ) -> dict:
         # Esta es la funcion base de envio. Las notificaciones del sistema llaman a esta funcion.
         error = self._validate()
@@ -79,6 +80,23 @@ class SMTPEmailService:
         message["To"] = recipient_email
         message.set_content(text_body or _html_to_text(html_body))
         message.add_alternative(html_body, subtype="html")
+
+        # Adjuntos opcionales: [{filename, content_bytes, mime}]
+        for attachment in attachments or []:
+            filename = str(attachment.get("filename") or "adjunto")
+            content_bytes = attachment.get("content_bytes")
+            mime = str(attachment.get("mime") or "application/octet-stream")
+            if not content_bytes:
+                continue
+            maintype, _, subtype = mime.partition("/")
+            maintype = maintype or "application"
+            subtype = subtype or "octet-stream"
+            message.add_attachment(
+                content_bytes,
+                maintype=maintype,
+                subtype=subtype,
+                filename=filename,
+            )
 
         try:
             if self.use_ssl:
@@ -250,3 +268,202 @@ def send_role_assigned_notification(
         "message": "Correo de rol asignado enviado" if result["ok"] else result["message"],
         "sent_count": 1 if result["ok"] else 0,
     }
+
+
+def _planning_share_template(payload: dict) -> tuple[str, str]:
+    # Plantilla: correo para Director/Coordinador cuando un docente comparte una planificacion.
+    plan_type = payload.get("plan_type", "annual")
+    subject_name = payload.get("subject", "")
+    course = payload.get("course", "")
+    year = payload.get("year", "")
+    plan_kind = payload.get("plan_kind", "Tecnica")
+    module_name = payload.get("module_name", "")
+    module_code = payload.get("module_code", "")
+    uc_code = payload.get("uc_code", "")
+    uc_title = payload.get("uc_title", "")
+    ra_title = payload.get("ra_title", "")
+    ra_domain = payload.get("ra_domain", "")
+    shared_by_name = payload.get("shared_by_name", "Docente")
+    shared_by_email = payload.get("shared_by_email", "")
+    app_link = payload.get("app_link", "")
+
+    subject = f"Planificacion compartida ({subject_name} - {course} - {year})"
+    html = f"""
+    <h2>Planificacion compartida</h2>
+    <p>Un docente compartio una planificacion desde <strong>EduNova</strong>.</p>
+    <ul>
+      <li><strong>Tipo:</strong> {plan_type}</li>
+      <li><strong>Modalidad:</strong> {plan_kind}</li>
+      <li><strong>Asignatura:</strong> {subject_name}</li>
+      <li><strong>Curso:</strong> {course}</li>
+      <li><strong>Ano:</strong> {year}</li>
+      <li><strong>Modulo:</strong> {module_name} ({module_code})</li>
+      <li><strong>UC:</strong> {uc_code} - {uc_title}</li>
+      <li><strong>RA:</strong> {ra_title}</li>
+      <li><strong>Nivel dominio RA:</strong> {ra_domain}</li>
+      <li><strong>Compartido por:</strong> {shared_by_name} {f"({shared_by_email})" if shared_by_email else ""}</li>
+    </ul>
+    """
+    if app_link:
+        html += f'<p><a href="{app_link}">Abrir en EduNova</a></p>'
+    html += "<p>Equipo EduNova</p>"
+    return subject, html
+
+
+def send_planning_shared_notification(body) -> dict:
+    """
+    Caso de uso: compartir una planificacion por correo a Director/Coordinadores.
+    - Busca destinatarios en profiles con role in ('Director','Coordinador')
+    - Envia correo a cada uno
+    - Registra log en email_notifications (si existe y RLS permite)
+    """
+    payload = body.model_dump() if hasattr(body, "model_dump") else dict(body or {})
+
+    recipients = []
+    try:
+        res = (
+            supabase.table("profiles")
+            .select("email, role, status")
+            .in_("role", ["Director", "Coordinador"])
+            .execute()
+        )
+        rows = res.data or []
+        for row in rows:
+            if str(row.get("status") or "active") != "active":
+                continue
+            email = str(row.get("email") or "").strip()
+            if email:
+                recipients.append(email)
+    except Exception:
+        # Si profiles no es accesible por RLS o por permisos, usamos DIRECTOR_EMAIL del .env
+        pass
+
+    # Fallback SIEMPRE: aunque la consulta no de error puede devolver [] por RLS.
+    # En ese caso igual debemos tener al menos el correo del director configurado.
+    if settings.director_email:
+        recipients.append(settings.director_email)
+
+    recipients = sorted(list({r.lower(): r for r in recipients}.values()))
+    if not recipients:
+        return {"ok": False, "message": "No hay destinatarios (Director/Coordinador) configurados", "sent_count": 0}
+
+    subject, html = _planning_share_template(payload)
+    sent_count = 0
+    last_error = None
+
+    for recipient in recipients:
+        result = email_service.send_email(recipient, subject, html)
+        if not result.get("ok"):
+            last_error = result.get("message") or last_error
+        _log_email_notification(
+            template_key="planning_shared",
+            recipient_email=recipient,
+            recipient_name="Privileged",
+            subject=subject,
+            status="sent" if result["ok"] else "failed",
+            actor_name=payload.get("shared_by_name", ""),
+            actor_email=payload.get("shared_by_email", "") or "",
+            metadata={
+                "kind": "planning_shared",
+                "plan_type": payload.get("plan_type"),
+                "subject": payload.get("subject"),
+                "course": payload.get("course"),
+                "year": payload.get("year"),
+            },
+            error_message=None if result["ok"] else result.get("message"),
+        )
+        if result["ok"]:
+            sent_count += 1
+
+    if sent_count:
+        return {"ok": True, "message": "Planificacion enviada a Director/Coordinador", "sent_count": sent_count}
+    # Devuelve el motivo real del fallo (SMTP / auth / etc.) para que el frontend lo muestre.
+    return {
+        "ok": False,
+        "message": last_error or "No se pudo enviar la planificacion por correo",
+        "sent_count": 0,
+    }
+
+
+def send_planning_shared_pdf_notification(body) -> dict:
+    """
+    Igual que send_planning_shared_notification, pero adjunta el PDF generado en frontend.
+    """
+    payload = body.model_dump() if hasattr(body, "model_dump") else dict(body or {})
+
+    recipients = []
+    try:
+        res = (
+            supabase.table("profiles")
+            .select("email, role, status")
+            .in_("role", ["Director", "Coordinador"])
+            .execute()
+        )
+        rows = res.data or []
+        for row in rows:
+            if str(row.get("status") or "active") != "active":
+                continue
+            email = str(row.get("email") or "").strip()
+            if email:
+                recipients.append(email)
+    except Exception:
+        pass
+
+    if settings.director_email:
+        recipients.append(settings.director_email)
+
+    recipients = sorted(list({r.lower(): r for r in recipients}.values()))
+    if not recipients:
+        return {"ok": False, "message": "No hay destinatarios (Director/Coordinador) configurados", "sent_count": 0}
+
+    subject, html = _planning_share_template(payload)
+
+    import base64
+
+    try:
+        pdf_bytes = base64.b64decode(payload.get("pdf_base64") or "")
+    except Exception:
+        return {"ok": False, "message": "El PDF adjunto no es valido (base64)", "sent_count": 0}
+
+    filename = str(payload.get("filename") or "planificacion.pdf")
+    attachments = [
+        {"filename": filename, "content_bytes": pdf_bytes, "mime": "application/pdf"}
+    ]
+
+    sent_count = 0
+    last_error = None
+    for recipient in recipients:
+        result = email_service.send_email(
+            recipient_email=recipient,
+            subject=subject,
+            html_body=html,
+            attachments=attachments,
+        )
+        if not result.get("ok"):
+            last_error = result.get("message") or last_error
+
+        _log_email_notification(
+            template_key="planning_shared_pdf",
+            recipient_email=recipient,
+            recipient_name="Privileged",
+            subject=subject,
+            status="sent" if result["ok"] else "failed",
+            actor_name=payload.get("shared_by_name", ""),
+            actor_email=payload.get("shared_by_email", "") or "",
+            metadata={
+                "kind": "planning_shared_pdf",
+                "plan_type": payload.get("plan_type"),
+                "subject": payload.get("subject"),
+                "course": payload.get("course"),
+                "year": payload.get("year"),
+                "filename": filename,
+            },
+            error_message=None if result["ok"] else result.get("message"),
+        )
+
+        if result["ok"]:
+            sent_count += 1
+
+    if sent_count:
+        return {"ok": True, "message": "Planificacion (PDF) enviada al Director/Coordinador", "sent_count": sent_count}
+    return {"ok": False, "message": last_error or "No se pudo enviar la planificacion (PDF)", "sent_count": 0}

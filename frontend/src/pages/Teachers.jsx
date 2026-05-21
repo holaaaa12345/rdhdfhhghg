@@ -3,8 +3,17 @@ import * as XLSX from 'xlsx-js-style'
 import Modal from '../components/Modal.jsx'
 import { buildSubjectOptions } from '../data/projectOptions.js'
 import { teachersService } from '../services/academicServices.js'
+import { provisionService } from '../services/api.js'
 
 const initials = (name = '') => name.split(' ').map(part => part[0]).slice(0, 2).join('').toUpperCase()
+
+// Phone is saved as text, but we enforce digits-only in the UI.
+// In our context, "telefono" is used as the teacher number/contact number.
+const MAX_TEACHER_PHONE_DIGITS = 10
+const sanitizeTeacherPhone = (value) =>
+  String(value || '')
+    .replace(/\D/g, '')
+    .slice(0, MAX_TEACHER_PHONE_DIGITS)
 
 const emptyForm = () => ({
   name: '',
@@ -12,6 +21,17 @@ const emptyForm = () => ({
   phone: '',
   status: 'active',
 })
+
+const normalizeEmail = (value) => String(value || '').trim().toLowerCase()
+
+const buildTempPassword = (phoneValue) => {
+  const digits = String(phoneValue || '').replace(/\D/g, '')
+  if (digits.length >= 8) return digits.slice(-8)
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
+  let out = ''
+  for (let i = 0; i < 10; i += 1) out += alphabet[Math.floor(Math.random() * alphabet.length)]
+  return out
+}
 
 export default function Teachers({ showToast, onNavigate }) {
   const [teachers, setTeachers] = useState([])
@@ -28,7 +48,9 @@ export default function Teachers({ showToast, onNavigate }) {
 
   const [selected, setSelected] = useState(null)
   const [form, setForm] = useState(emptyForm())
+  const [createAccessAccount, setCreateAccessAccount] = useState(false)
   const [subjectDraft, setSubjectDraft] = useState('')
+  const [customSubjectDraft, setCustomSubjectDraft] = useState('')
   const [subjectList, setSubjectList] = useState([])
 
   const fileRef = useRef(null)
@@ -69,12 +91,16 @@ export default function Teachers({ showToast, onNavigate }) {
   }, [teachers, search, statusFilter])
 
   const setField = (field) => (event) => {
-    setForm(prev => ({ ...prev, [field]: event.target.value }))
+    const raw = event.target.value
+    const value = field === 'phone' ? sanitizeTeacherPhone(raw) : raw
+    setForm(prev => ({ ...prev, [field]: value }))
   }
 
   const resetForm = () => {
     setForm(emptyForm())
+    setCreateAccessAccount(false)
     setSubjectDraft(subjectOptions[0] || '')
+    setCustomSubjectDraft('')
     setSubjectList([])
   }
 
@@ -96,7 +122,8 @@ export default function Teachers({ showToast, onNavigate }) {
       phone: teacher.phone || '',
       status: teacher.status || 'active',
     })
-    setSubjectDraft(subjectOptions[0] || teacher.subjectList[0] || '')
+    setSubjectDraft(subjectOptions[0] || teacher.subjectList?.[0] || '')
+    setCustomSubjectDraft('')
     setSubjectList(teacher.subjectList || [])
     setEditModal(true)
   }
@@ -112,6 +139,13 @@ export default function Teachers({ showToast, onNavigate }) {
     setSubjectList(prev => (prev.includes(clean) ? prev : [...prev, clean]))
   }
 
+  const addCustomSubject = () => {
+    if (!customSubjectDraft.trim()) return
+    const clean = customSubjectDraft.trim()
+    setSubjectList(prev => (prev.includes(clean) ? prev : [...prev, clean]))
+    setCustomSubjectDraft('')
+  }
+
   const removeSubject = (subject) => {
     setSubjectList(prev => prev.filter(item => item !== subject))
   }
@@ -121,6 +155,19 @@ export default function Teachers({ showToast, onNavigate }) {
       showToast('error', 'El nombre del docente es obligatorio')
       return false
     }
+
+    if (form.phone) {
+      // Common formats are 8 digits (local) or 10 digits (with area code).
+      if (form.phone.length < 8) {
+        showToast('warning', 'El telefono debe tener al menos 8 digitos (solo numeros).')
+        return false
+      }
+      if (form.phone.length > MAX_TEACHER_PHONE_DIGITS) {
+        showToast('warning', `El telefono no puede pasar de ${MAX_TEACHER_PHONE_DIGITS} digitos.`)
+        return false
+      }
+    }
+
     if (subjectList.length === 0) {
       showToast('warning', 'Agrega al menos una asignatura')
       return false
@@ -132,7 +179,30 @@ export default function Teachers({ showToast, onNavigate }) {
     if (!validateForm()) return
     setLoading(true)
     try {
-      await teachersService.createFromForm(form, subjectList)
+      const email = normalizeEmail(form.email)
+
+      if (createAccessAccount) {
+        if (!email) {
+          showToast('error', 'Para crear acceso, el correo es obligatorio.')
+          return
+        }
+
+        // Validar ANTES de crear el usuario en Auth (si ya existe, paramos aqui).
+        await teachersService.assertTeacherEmailAvailable(email)
+
+        const tempPassword = buildTempPassword(form.phone)
+        await provisionService.createAuthUser({
+          email,
+          password: tempPassword,
+          full_name: form.name,
+          role: 'Docente',
+        })
+
+        showToast('success', `Acceso creado: ${email} | Password temporal: ${tempPassword}`)
+      }
+
+      // Si acabamos de crear el Auth user, ahora ya existira en profiles; evitamos bloquear por eso.
+      await teachersService.createFromForm({ ...form, email, __skipProfileCheck: Boolean(createAccessAccount) }, subjectList)
       showToast('success', 'Docente registrado')
       setCreateModal(false)
       resetForm()
@@ -140,7 +210,12 @@ export default function Teachers({ showToast, onNavigate }) {
       fetchSubjectOptions()
     } catch (error) {
       console.error(error)
-      showToast('error', 'Error al registrar docente')
+      const msg = String(error?.response?.data?.detail || error?.message || '')
+      if (msg) {
+        showToast('error', msg)
+      } else {
+        showToast('error', 'Error al registrar docente')
+      }
     } finally {
       setLoading(false)
     }
@@ -293,6 +368,30 @@ export default function Teachers({ showToast, onNavigate }) {
           </button>
         </div>
       </div>
+
+      <div className="form-group" style={{ marginTop: '0.75rem' }}>
+        <label>Otra asignatura (si no aparece en la lista)</label>
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <input
+            className="form-control"
+            value={customSubjectDraft}
+            onChange={(event) => setCustomSubjectDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter') return
+              event.preventDefault()
+              addCustomSubject()
+            }}
+            placeholder="Escribe la asignatura (ej: Informatica, Formacion Humana...)"
+          />
+          <button type="button" className="btn btn-secondary btn-sm" onClick={addCustomSubject} title="Agregar asignatura personalizada">
+            <i className="fas fa-plus" />Agregar
+          </button>
+        </div>
+        <div style={{ fontSize: '0.76rem', color: '#6b7280', marginTop: 6 }}>
+          Esto no elimina las asignaturas predefinidas; solo te deja agregar una nueva si hace falta.
+        </div>
+      </div>
+
       {subjectList.length > 0 && (
         <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginTop: '0.5rem' }}>
           {subjectList.map(subject => (
@@ -468,7 +567,32 @@ export default function Teachers({ showToast, onNavigate }) {
             </div>
             <div className="form-group">
               <label>Telefono</label>
-              <input className="form-control" value={form.phone} onChange={setField('phone')} placeholder="70000000" />
+              <input
+                className="form-control"
+                type="tel"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                maxLength={MAX_TEACHER_PHONE_DIGITS}
+                value={form.phone}
+                onChange={setField('phone')}
+                placeholder="70000000"
+              />
+              <div style={{ fontSize: '0.76rem', color: '#6b7280', marginTop: 6 }}>
+                Solo numeros. Maximo {MAX_TEACHER_PHONE_DIGITS} digitos.
+              </div>
+            </div>
+            <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <input
+                  type="checkbox"
+                  checked={createAccessAccount}
+                  onChange={(e) => setCreateAccessAccount(e.target.checked)}
+                />
+                Crear cuenta de acceso para iniciar sesion (correo + password temporal)
+              </label>
+              <div style={{ fontSize: '0.76rem', color: '#6b7280', marginTop: 6 }}>
+                Si activas esto, el sistema crea el usuario en Supabase Auth. El password temporal se genera con los ultimos 8 digitos del telefono (o uno aleatorio si no hay telefono).
+              </div>
             </div>
             <div className="form-group">
               <label>Estado</label>
@@ -538,7 +662,18 @@ export default function Teachers({ showToast, onNavigate }) {
             </div>
             <div className="form-group">
               <label>Telefono</label>
-              <input className="form-control" value={form.phone} onChange={setField('phone')} />
+              <input
+                className="form-control"
+                type="tel"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                maxLength={MAX_TEACHER_PHONE_DIGITS}
+                value={form.phone}
+                onChange={setField('phone')}
+              />
+              <div style={{ fontSize: '0.76rem', color: '#6b7280', marginTop: 6 }}>
+                Solo numeros. Maximo {MAX_TEACHER_PHONE_DIGITS} digitos.
+              </div>
             </div>
             <div className="form-group">
               <label>Estado</label>

@@ -13,6 +13,7 @@ import {
 } from '../services/planningTemplateService.js'
 import { ACADEMIC_SUBJECT_OPTIONS, buildAcademicCourse } from '../data/projectOptions.js'
 import { studentsService } from '../services/academicServices.js'
+import { planningShareService } from '../services/api.js'
 
 const YEARS = [2026, 2025, 2024]
 
@@ -33,6 +34,17 @@ const sanitizeForPdf = (value) => {
     .replace(/[–—]/g, '-')
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, "'")
+}
+
+const arrayBufferToBase64 = (buffer) => {
+  const bytes = new Uint8Array(buffer)
+  const chunkSize = 0x8000
+  let binary = ''
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize)
+    binary += String.fromCharCode(...chunk)
+  }
+  return btoa(binary)
 }
 
 const svgToPngDataUrl = async (svgText, width = 220, height = 220) => {
@@ -223,6 +235,7 @@ const isPlanningSchemaIssue = (error) => {
 }
 
 export function AnnualPlanning({ showToast, onNavigate }) {
+  const [authUserId, setAuthUserId] = useState('')
   const [subject, setSubject] = useState(ACADEMIC_SUBJECT_OPTIONS[0] || '')
   const [courseOptions, setCourseOptions] = useState([])
   const [section, setSection] = useState('')
@@ -243,6 +256,7 @@ export function AnnualPlanning({ showToast, onNavigate }) {
   const [cModal, setCModal] = useState(false)
   const [metaModal, setMetaModal] = useState(false)
   const [templateModal, setTemplateModal] = useState(false)
+  const [sendingShare, setSendingShare] = useState(false)
   const [selected, setSelected] = useState(null)
   const [selectedTemplateId, setSelectedTemplateId] = useState('')
   const [pendingTemplateId, setPendingTemplateId] = useState('')
@@ -259,9 +273,29 @@ export function AnnualPlanning({ showToast, onNavigate }) {
   })
   const course = buildAcademicCourse(subject, section)
 
+  // Draft persistence:
+  // When the user copies text from another tab/app and comes back, the browser may refresh,
+  // the session may re-check, or the page may remount. To avoid losing what was typed but not saved yet,
+  // we keep a localStorage draft for the "Datos generales" and "RA" modals.
+  const safeDraftSlug = (value) => String(value || '').replace(/[^a-z0-9]+/gi, '_').slice(0, 80)
+  // Use course+year only so drafts survive planId timing differences (planId can be null during first load).
+  const draftScope = `${safeDraftSlug(course)}_${year}`
+  // Important: the draft key must be stable even if the auth state briefly resets
+  // (for example when the tab loses focus and the session re-check runs).
+  // If we include authUserId, the key can flip between "anon" and the real uid and the draft
+  // looks like it disappeared. We scope by course+year only which is enough for this UI.
+  const draftKey = (kind, extra = '') =>
+    `edunova:annual:draft:${kind}:${draftScope}${extra ? `:${extra}` : ''}`
+  const uiStateKey = `edunova:annual:ui:${draftScope}`
+  const [pendingUiRestore, setPendingUiRestore] = useState(null)
+  const [uiRestoreApplied, setUiRestoreApplied] = useState(false)
+
   useEffect(() => {
     ;(async () => {
       try {
+        const { data: { user } } = await supabase.auth.getUser()
+        setAuthUserId(user?.id || '')
+
         const codes = await studentsService.fetchCourseOptions()
         setCourseOptions(codes)
         setSection((current) => current || codes[0] || '')
@@ -271,6 +305,144 @@ export function AnnualPlanning({ showToast, onNavigate }) {
       }
     })()
   }, [])
+
+  // Persist which modal was open (Datos generales / Agregar RA / Editar RA).
+  // Browsers can discard/reload a tab when you alt-tab to another window; drafts help preserve text,
+  // and this UI state lets us reopen the same modal automatically after remount.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    let open = null
+    if (metaModal) open = 'meta'
+    else if (addModal) open = 'ra_add'
+    else if (editModal) open = 'ra_edit'
+
+    try {
+      if (!open) {
+        window.localStorage.removeItem(uiStateKey)
+        return
+      }
+      window.localStorage.setItem(uiStateKey, JSON.stringify({
+        open,
+        raId: open === 'ra_edit' && selected?.id ? String(selected.id) : null,
+        ts: Date.now(),
+      }))
+    } catch {
+      // ignore
+    }
+  }, [uiStateKey, metaModal, addModal, editModal, selected?.id])
+
+  // Read the last UI state for this course+year scope so we can restore it after reload/remount.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    setUiRestoreApplied(false)
+    try {
+      const raw = window.localStorage.getItem(uiStateKey)
+      if (!raw) {
+        setPendingUiRestore(null)
+        return
+      }
+      const parsed = JSON.parse(raw)
+      if (!parsed || typeof parsed !== 'object' || !parsed.open) {
+        setPendingUiRestore(null)
+        return
+      }
+      const ts = Number(parsed.ts || 0)
+      // Only restore "recent" sessions; otherwise we might reopen modals days later unexpectedly.
+      if (ts && Date.now() - ts > 2 * 60 * 60 * 1000) {
+        window.localStorage.removeItem(uiStateKey)
+        setPendingUiRestore(null)
+        return
+      }
+      setPendingUiRestore({
+        open: String(parsed.open || ''),
+        raId: parsed.raId ? String(parsed.raId) : null,
+      })
+    } catch {
+      setPendingUiRestore(null)
+    }
+  }, [uiStateKey])
+
+  // Restore and autosave drafts for Meta and RA modals.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!metaModal) return
+    try {
+      const raw = window.localStorage.getItem(draftKey('meta'))
+      if (!raw) return
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object') {
+        setMetaForm((current) => ({ ...current, ...parsed }))
+      }
+    } catch {
+      // ignore
+    }
+  }, [metaModal, authUserId, course, year, planId])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!metaModal) return
+    const t = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(draftKey('meta'), JSON.stringify(metaForm))
+      } catch {
+        // ignore
+      }
+    }, 250)
+    return () => window.clearTimeout(t)
+  }, [metaModal, metaForm, authUserId, course, year, planId])
+
+  const isRaModalOpen = addModal || editModal
+  const raDraftId = selected?.id ? String(selected.id) : (addModal ? 'new' : '')
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!isRaModalOpen) return
+    try {
+      const raw = window.localStorage.getItem(draftKey('ra', raDraftId))
+      if (!raw) return
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object') {
+        setForm((current) => ({ ...current, ...parsed }))
+      }
+    } catch {
+      // ignore
+    }
+  }, [isRaModalOpen, raDraftId, authUserId, course, year, planId])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!isRaModalOpen) return
+    const t = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(draftKey('ra', raDraftId), JSON.stringify(form))
+      } catch {
+        // ignore
+      }
+    }, 250)
+    return () => window.clearTimeout(t)
+  }, [isRaModalOpen, raDraftId, form, authUserId, course, year, planId])
+
+  // When the tab is closed or refreshed while a modal is open, force-save the latest draft.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const handler = () => {
+      try {
+        if (metaModal) window.localStorage.setItem(draftKey('meta'), JSON.stringify(metaForm))
+        if (isRaModalOpen) window.localStorage.setItem(draftKey('ra', raDraftId), JSON.stringify(form))
+      } catch {
+        // ignore
+      }
+    }
+    window.addEventListener('beforeunload', handler)
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') handler()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.removeEventListener('beforeunload', handler)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [metaModal, metaForm, isRaModalOpen, raDraftId, form, course, year])
 
   useEffect(() => {
     fetchTemplates()
@@ -652,6 +824,13 @@ export function AnnualPlanning({ showToast, onNavigate }) {
         type: 'planning',
       })
 
+      // Clear local draft on successful save.
+      try {
+        if (typeof window !== 'undefined') window.localStorage.removeItem(draftKey('ra', 'new'))
+      } catch {
+        // ignore
+      }
+
       setAddModal(false)
       showToast('success', 'Resultado de Aprendizaje agregado a la matriz')
     } catch (error) {
@@ -685,6 +864,43 @@ export function AnnualPlanning({ showToast, onNavigate }) {
     setErrors({})
     setEditModal(true)
   }
+
+  // Restore the last-open modal automatically after a browser discard/reload.
+  // Drafts restore the text; this restores *where* the user was editing.
+  useEffect(() => {
+    if (uiRestoreApplied) return
+    if (!pendingUiRestore || !pendingUiRestore.open) return
+
+    // Avoid reopening modals while the main plan is still loading and about to overwrite state.
+    if (loading) return
+
+    if (pendingUiRestore.open === 'meta') {
+      setMetaModal(true)
+      setUiRestoreApplied(true)
+      return
+    }
+
+    if (pendingUiRestore.open === 'ra_add') {
+      openAdd()
+      setUiRestoreApplied(true)
+      return
+    }
+
+    if (pendingUiRestore.open === 'ra_edit') {
+      const targetId = pendingUiRestore.raId ? String(pendingUiRestore.raId) : ''
+      if (!targetId) {
+        setUiRestoreApplied(true)
+        return
+      }
+
+      const row = (plans || []).find((item) => String(item?.id) === targetId)
+      if (row) {
+        openEdit(row)
+      }
+      // Even if we didn't find it (deleted/moved), don't keep trying forever.
+      setUiRestoreApplied(true)
+    }
+  }, [pendingUiRestore, uiRestoreApplied, loading, plans])
 
   const handleEdit = async () => {
     if (!validate()) return
@@ -747,6 +963,13 @@ export function AnnualPlanning({ showToast, onNavigate }) {
         details: `Se actualizo ${form.title.trim()} en el plan ${course} - ${year}`,
         type: 'planning',
       })
+
+      // Clear local draft on successful save.
+      try {
+        if (typeof window !== 'undefined') window.localStorage.removeItem(draftKey('ra', String(selected?.id || '')))
+      } catch {
+        // ignore
+      }
 
       setEditModal(false)
       showToast('success', 'RA actualizado correctamente')
@@ -899,6 +1122,13 @@ export function AnnualPlanning({ showToast, onNavigate }) {
         type: 'planning',
       })
 
+      // Clear local draft on successful save.
+      try {
+        if (typeof window !== 'undefined') window.localStorage.removeItem(draftKey('meta'))
+      } catch {
+        // ignore
+      }
+
       if (closeModal) setMetaModal(false)
       showToast('success', actionLabel)
       return true
@@ -953,7 +1183,7 @@ export function AnnualPlanning({ showToast, onNavigate }) {
     { label: 'Horas por semana', value: planMeta.hours_per_week ? `${planMeta.hours_per_week} h` : 'Sin definir', icon: 'fa-clock' },
   ]
 
-  const exportMatrixPdf = async () => {
+  const exportMatrixPdf = async ({ download = true, audit = true, returnBlob = false } = {}) => {
     try {
       // Export institucional (formato tipo "matriz" del centro):
       // - Pagina vertical
@@ -961,17 +1191,19 @@ export function AnnualPlanning({ showToast, onNavigate }) {
       // - Un bloque por RA: titulo RA arriba + tabla EC/actividades/evaluacion/contenidos abajo
       const { data: { user } } = await supabase.auth.getUser()
 
-      // Audit (non-critical): if audit table is blocked, the app still exports.
-      try {
-        await recordAuditEvent({
-          user,
-          module: 'Planificacion Anual',
-          action: 'Exportar matriz (PDF)',
-          details: `${course} - ${year}`,
-          type: 'export',
-        })
-      } catch {
-        // ignore
+      if (audit) {
+        // Audit (non-critical): if audit table is blocked, the app still exports.
+        try {
+          await recordAuditEvent({
+            user,
+            module: 'Planificacion Anual',
+            action: 'Exportar matriz (PDF)',
+            details: `${course} - ${year}`,
+            type: 'export',
+          })
+        } catch {
+          // ignore
+        }
       }
 
       const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' })
@@ -994,66 +1226,96 @@ export function AnnualPlanning({ showToast, onNavigate }) {
       // Para activarlo: coloca el archivo en `frontend/public/minerd_logo.png`.
       // Si no existe, el PDF se genera igual, solo sin logo.
       let logoDataUrl = null
+      let logoW = 0
+      let logoH = 0
+
       try {
         const resp = await fetch('/minerd_logo.png', { cache: 'no-store' })
         if (!resp.ok) throw new Error('logo-not-found')
         const blob = await resp.blob()
-        const objectUrl = URL.createObjectURL(blob)
 
+        // Convertimos a dataURL sin deformar (y leemos el tamano real de la imagen).
         logoDataUrl = await new Promise((resolve) => {
-          const img = new Image()
-          img.onload = () => {
-            try {
-              const canvas = document.createElement('canvas')
-              canvas.width = 220
-              canvas.height = 220
-              const ctx = canvas.getContext('2d')
-              ctx.clearRect(0, 0, 220, 220)
-              ctx.drawImage(img, 0, 0, 220, 220)
-              URL.revokeObjectURL(objectUrl)
-              resolve(canvas.toDataURL('image/png'))
-            } catch {
-              URL.revokeObjectURL(objectUrl)
+          const reader = new FileReader()
+          reader.onload = () => resolve(String(reader.result || ''))
+          reader.onerror = () => resolve(null)
+          reader.readAsDataURL(blob)
+        })
+
+        if (logoDataUrl) {
+          await new Promise((resolve) => {
+            const img = new Image()
+            img.onload = () => {
+              logoW = img.naturalWidth || img.width || 0
+              logoH = img.naturalHeight || img.height || 0
               resolve(null)
             }
-          }
-          img.onerror = () => resolve(null)
-          img.src = objectUrl
-        })
+            img.onerror = () => resolve(null)
+            img.src = logoDataUrl
+          })
+        }
       } catch {
         logoDataUrl = null
       }
 
-      if (logoDataUrl) {
-        doc.addImage(logoDataUrl, 'PNG', pageW / 2 - 60, 18, 120, 120)
+      // Encabezado (similar al formato institucional del profesor):
+      // - Logo pequeno arriba
+      // - "Direccion General..." en negrita
+      // - "Direccion de Educacion Tecnico Profesional" normal
+      // - Institucion en negrita mas grande
+      // - Titulos del documento
+      let headerY = 34
+      if (logoDataUrl && logoW > 0 && logoH > 0) {
+        // El modelo del profesor usa el logo mas pequeno.
+        const maxW = 120
+        const maxH = 70
+        const ratio = logoW / logoH
+        let drawW = maxW
+        let drawH = drawW / ratio
+        if (drawH > maxH) {
+          drawH = maxH
+          drawW = drawH * ratio
+        }
+        const x = pageW / 2 - drawW / 2
+        const y = 18
+        doc.addImage(logoDataUrl, 'PNG', x, y, drawW, drawH)
+        // More breathing room so the next line doesn't stick to the red "EDUCACION" inside the logo.
+        headerY = y + drawH + 18
+      } else {
+        // Fallback si el logo no existe.
+        doc.setFont('helvetica', 'bold')
+        doc.setFontSize(9)
+        doc.setTextColor(15, 23, 42)
+        doc.text('GOBIERNO DE LA REPUBLICA DOMINICANA', pageW / 2, headerY, { align: 'center' })
+        headerY += 12
+        doc.setTextColor(220, 38, 38)
+        doc.text('EDUCACION', pageW / 2, headerY, { align: 'center' })
+        headerY += 12
       }
 
-      let headerY = logoDataUrl ? 152 : 86
+      doc.setTextColor(15, 23, 42)
+      // Keep the hierarchy close to the institutional model (no oversized headings).
       doc.setFont('helvetica', 'bold')
       doc.setFontSize(9)
-      doc.setTextColor(15, 23, 42)
-      doc.text('GOBIERNO DE LA REPUBLICA DOMINICANA', pageW / 2, headerY, { align: 'center' })
-      headerY += 12
-      doc.setTextColor(220, 38, 38)
-      doc.text('EDUCACION', pageW / 2, headerY, { align: 'center' })
-      headerY += 12
-      doc.setTextColor(15, 23, 42)
-      doc.setFontSize(9)
-      doc.setFont('helvetica', 'normal')
       doc.text('Direccion General de Educacion Secundaria', pageW / 2, headerY, { align: 'center' })
       headerY += 12
+
+      doc.setFont('helvetica', 'normal')
+      doc.setFontSize(9)
       doc.text('Direccion de Educacion Tecnico Profesional', pageW / 2, headerY, { align: 'center' })
       headerY += 14
 
       doc.setFont('helvetica', 'bold')
-      doc.setFontSize(11)
+      doc.setFontSize(10)
       doc.text(sanitizeForPdf(planMeta.institution_name || 'INSTITUCION EDUCATIVA'), pageW / 2, headerY, { align: 'center' })
       headerY += 16
+
       doc.setFontSize(10)
       doc.text('PLANIFICACION ANUAL BAJO ENFOQUE POR COMPETENCIAS', pageW / 2, headerY, { align: 'center' })
       headerY += 14
-      doc.setFontSize(9)
+
       doc.setFont('helvetica', 'normal')
+      doc.setFontSize(9)
       doc.text(
         `MATRIZ DE PLANIFICACION POR RESULTADO DE APRENDIZAJE (RA) - ${kindLabel.toUpperCase()}`,
         pageW / 2,
@@ -1235,11 +1497,91 @@ export function AnnualPlanning({ showToast, onNavigate }) {
       }
 
       const fileName = `matriz_${String(course).replace(/[^a-z0-9]+/gi, '_')}_${year}.pdf`
-      doc.save(fileName)
-      showToast('success', 'PDF de la matriz descargado')
+
+      // Some browsers/environments block the internal FileSaver flow used by `doc.save(...)`.
+      // This explicit Blob download is more reliable.
+      const blob = doc.output('blob')
+
+      if (returnBlob) return { blob, fileName }
+
+      if (download) {
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = fileName
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+        showToast('success', 'PDF de la matriz descargado')
+      }
     } catch (error) {
       console.error(error)
       showToast('error', 'Error al exportar PDF de la matriz')
+    }
+  }
+
+  const sharePlanningByEmail = async () => {
+    if (sendingShare) {
+      showToast?.('warning', 'Ya se esta enviando la planificacion. Espera un momento...')
+      return
+    }
+
+    setSendingShare(true)
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) {
+        showToast?.('error', 'Debes iniciar sesion para compartir la planificacion')
+        return
+      }
+
+      showToast?.('info', 'Enviando planificacion... (puede tardar unos segundos)')
+
+      const built = await exportMatrixPdf({ download: false, audit: false, returnBlob: true })
+      if (!built?.blob) return
+      const pdfBase64 = arrayBufferToBase64(await built.blob.arrayBuffer())
+
+      const { data: profileRow } = await supabase
+        .from('profiles')
+        .select('full_name, email')
+        .eq('id', user.id)
+        .maybeSingle()
+
+      const sharedByName = profileRow?.full_name || user?.user_metadata?.full_name || user?.email || 'Docente'
+      const sharedByEmail = profileRow?.email || user?.email || ''
+
+      const firstRa = plans?.[0] || {}
+
+      const res = await planningShareService.shareAnnualPlanningPdf({
+        plan_type: 'annual',
+        subject,
+        course,
+        year,
+        plan_kind: planMeta?.plan_kind || 'Tecnica',
+        module_name: planMeta?.module_name || '',
+        module_code: planMeta?.module_code || '',
+        uc_code: planMeta?.uc_code || '',
+        uc_title: planMeta?.uc_name || '',
+        ra_title: firstRa.title || '',
+        ra_domain: firstRa.domain_level || '',
+        shared_by_name: sharedByName,
+        shared_by_email: sharedByEmail || null,
+        app_link: window.location.href,
+        pdf_base64: pdfBase64,
+        filename: built.fileName,
+      })
+
+      if (!res?.data?.ok) {
+        throw new Error(res?.data?.message || 'No se pudo enviar la planificacion por correo')
+      }
+
+      showToast?.('success', res?.data?.message || 'Planificacion (PDF) enviada al Director/Coordinador por correo')
+    } catch (error) {
+      console.error(error)
+      const msg = String(error?.response?.data?.detail || error?.message || '')
+      showToast?.('error', msg || 'No se pudo enviar la planificacion por correo')
+    } finally {
+      setSendingShare(false)
     }
   }
 
@@ -1300,6 +1642,16 @@ export function AnnualPlanning({ showToast, onNavigate }) {
             <button className="btn btn-secondary" onClick={() => setTemplateModal(true)}><i className="fas fa-layer-group" />Aplicar plantilla</button>
             <button className="btn btn-secondary" onClick={() => setCModal(true)}><i className="fas fa-copy" />Copiar periodo</button>
             <button className="btn btn-secondary" onClick={() => setVModal(true)}><i className="fas fa-history" />Versiones</button>
+            <button
+              className="btn btn-secondary"
+              onClick={sharePlanningByEmail}
+              disabled={sendingShare}
+              title="Enviar esta planificacion por correo al Director/Coordinador"
+              style={sendingShare ? { opacity: 0.7, cursor: 'not-allowed' } : undefined}
+            >
+              <i className={`fas ${sendingShare ? 'fa-spinner fa-spin' : 'fa-paper-plane'}`} />
+              {sendingShare ? 'Enviando...' : 'Enviar al Director'}
+            </button>
             <button className="btn btn-secondary" onClick={exportMatrixPdf} title="Descargar matriz institucional en PDF">
               <i className="fas fa-file-pdf" />Exportar PDF
             </button>

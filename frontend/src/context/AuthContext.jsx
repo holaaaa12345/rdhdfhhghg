@@ -215,8 +215,9 @@ export function AuthProvider({ children }) {
   }
 
   const register = async (email, password, name) => {
+    const normalizedEmail = String(email || '').trim().toLowerCase()
     const { data, error } = await supabase.auth.signUp({
-      email,
+      email: normalizedEmail,
       password,
       options: {
         data: {
@@ -226,6 +227,11 @@ export function AuthProvider({ children }) {
     })
 
     if (error) throw error
+    // Supabase sometimes returns no error but no user when the email already exists.
+    // We convert that into a clear message so the UI doesn't "look like it worked".
+    if (!data?.user) {
+      throw new Error('Este correo ya esta registrado. Inicia sesion.')
+    }
 
     const nextProfile = await ensureProfile(data?.user)
     await recordAuditEvent({

@@ -5,6 +5,8 @@ import { StudentEntity } from '../domain/entities/StudentEntity.js'
 import { TeacherEntity } from '../domain/entities/TeacherEntity.js'
 import { CourseEntity } from '../domain/entities/CourseEntity.js'
 
+const normalizeEmail = (value) => String(value || '').trim().toLowerCase()
+
 const isMissingColumn = (error, column = 'user_id') => {
   const code = String(error?.code || '')
   const message = String(error?.message || '').toLowerCase()
@@ -133,6 +135,41 @@ class TeachersService extends BaseCrudService {
     super({ client: supabase, tableName: 'teachers', entityClass: TeacherEntity })
   }
 
+  async assertTeacherEmailAvailable(email, { excludeId, skipProfileCheck = false } = {}) {
+    const normalized = normalizeEmail(email)
+    if (!normalized) return
+
+    // 1) Block using an email that already exists as an Auth/Profile user.
+    // During "create access account" flow, we purposely create the Auth user first,
+    // so we skip this check on the final teachers insert.
+    if (!skipProfileCheck) {
+      const profileRes = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('email', normalized)
+        .maybeSingle()
+
+      if (profileRes.error) throw profileRes.error
+      if (profileRes.data?.id) {
+        throw new Error('Ese correo ya esta registrado como usuario en el sistema. Usa otro correo.')
+      }
+    }
+
+    // 2) Prevent duplicates inside the teachers catalog too.
+    let teacherQuery = supabase
+      .from('teachers')
+      .select('id, email')
+      .ilike('email', normalized)
+
+    if (excludeId) teacherQuery = teacherQuery.neq('id', excludeId)
+
+    const teacherRes = await teacherQuery.maybeSingle()
+    if (teacherRes.error) throw teacherRes.error
+    if (teacherRes.data?.id) {
+      throw new Error('Ese correo ya esta registrado en el catalogo de docentes.')
+    }
+  }
+
   async fetchSubjectOptions() {
     const [{ data: courses }, { data: teacherRows }] = await Promise.all([
       supabase.from('courses').select('code, name').order('created_at', { ascending: true }),
@@ -159,6 +196,10 @@ class TeachersService extends BaseCrudService {
     if (!user) throw new Error('Usuario no autenticado')
     const entity = TeacherEntity.fromForm(form, subjectList)
 
+    const skipProfileCheck = Boolean(form?.__skipProfileCheck)
+    await this.assertTeacherEmailAvailable(entity.email, { skipProfileCheck })
+    entity.email = normalizeEmail(entity.email) || entity.email
+
     const res = await supabase.from('teachers').insert([{ ...entity.toRow(), user_id: user.id }]).select().single()
     if (res.error && isMissingColumn(res.error, 'user_id')) {
       const legacy = await supabase.from('teachers').insert([entity.toRow()]).select().single()
@@ -170,7 +211,10 @@ class TeachersService extends BaseCrudService {
   }
 
   async updateFromForm(id, form, subjectList = []) {
-    return this.update(id, TeacherEntity.fromForm(form, subjectList))
+    const entity = TeacherEntity.fromForm(form, subjectList)
+    await this.assertTeacherEmailAvailable(entity.email, { excludeId: id, skipProfileCheck: Boolean(form?.__skipProfileCheck) })
+    entity.email = normalizeEmail(entity.email) || entity.email
+    return this.update(id, entity)
   }
 
   async importRows(rawRows = []) {
@@ -181,6 +225,12 @@ class TeachersService extends BaseCrudService {
       .map(row => TeacherEntity.normalizeImportedRow(row))
       .filter(row => row.name)
     if (payload.length === 0) return []
+
+    // Validate emails (fail fast with a clear message).
+    for (const row of payload) {
+      await this.assertTeacherEmailAvailable(row.email)
+      row.email = normalizeEmail(row.email) || row.email
+    }
 
     const withUser = payload.map(row => ({ ...row, user_id: user.id }))
     const res = await supabase.from('teachers').insert(withUser).select()

@@ -5,11 +5,15 @@ from app.schemas.notification_schema import (
     EmailNotificationResponse,
     RegistrationNotificationRequest,
     RoleAssignedNotificationRequest,
+    PlanningShareRequest,
+    PlanningSharePdfRequest,
 )
 from app.services.email_service import (
     email_service,
     send_registration_notifications,
     send_role_assigned_notification,
+    send_planning_shared_notification,
+    send_planning_shared_pdf_notification,
 )
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
@@ -64,3 +68,34 @@ async def notify_role_assigned(body: RoleAssignedNotificationRequest):
         return EmailNotificationResponse(**result)
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"No se pudo procesar el correo de rol asignado: {error}")
+
+
+@router.post("/share-planning", response_model=EmailNotificationResponse)
+async def share_planning(body: PlanningShareRequest):
+    """
+    Comparte una planificacion por correo con los roles privilegiados:
+    - Director
+    - Coordinador
+    (segun la tabla profiles.role)
+    """
+    try:
+        result = send_planning_shared_notification(body)
+        return EmailNotificationResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"No se pudo compartir la planificacion: {error}")
+
+
+@router.post("/share-planning-pdf", response_model=EmailNotificationResponse)
+async def share_planning_pdf(body: PlanningSharePdfRequest):
+    """
+    Comparte una planificacion por correo adjuntando el PDF exportado.
+    """
+    try:
+        result = send_planning_shared_pdf_notification(body)
+        return EmailNotificationResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"No se pudo compartir la planificacion (PDF): {error}")

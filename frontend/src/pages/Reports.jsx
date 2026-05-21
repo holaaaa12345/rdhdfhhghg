@@ -397,7 +397,18 @@ export function Reports({ showToast, onNavigate }) {
         })
       }
 
-      doc.save(`${tipo.replace(/ /g, '_')}_${curso.replace(/ /g, '_')}_${periodo}.pdf`)
+      const fileName = `${tipo.replace(/ /g, '_')}_${curso.replace(/ /g, '_')}_${periodo}.pdf`
+
+      // Use explicit Blob download for better compatibility than `doc.save(...)`.
+      const blob = doc.output('blob')
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = fileName
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
       await saveToHistorial('PDF')
       showToast('success', 'PDF generado y descargado correctamente')
     } catch (error) {

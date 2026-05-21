@@ -2,6 +2,14 @@ import { useEffect, useState } from 'react'
 import { supabase } from '../services/supabaseClient.js'
 import { getDayIndexMonday0, startOfWeekMondayLocal, toISODateLocal } from '../utils/dateUtils.js'
 
+const isMissingColumn = (error, column = 'user_id') => {
+  const code = String(error?.code || '')
+  const message = String(error?.message || '').toLowerCase()
+  const details = String(error?.details || '').toLowerCase()
+  const combined = `${code} ${message} ${details}`
+  return combined.includes('42703') || (combined.includes('column') && combined.includes(column) && combined.includes('does not exist'))
+}
+
 const periodToNumber = (period) => {
   const match = String(period || '').match(/(\d+)/)
   return match ? Number(match[1]) : 0
@@ -223,6 +231,22 @@ export default function Dashboard({ onNavigate, showToast }) {
     try {
       const { data: { user } } = await supabase.auth.getUser()
 
+      // Determine if the current user is privileged (Director/Coordinador) to see global data.
+      // Docentes should only see their own data (user_id scoped).
+      let privileged = false
+      if (user) {
+        const profileRes = await supabase
+          .from('profiles')
+          .select('role, status')
+          .eq('id', user.id)
+          .maybeSingle()
+        if (!profileRes.error) {
+          const role = String(profileRes.data?.role || '')
+          const status = String(profileRes.data?.status || 'active')
+          privileged = (role === 'Director' || role === 'Coordinador') && status === 'active'
+        }
+      }
+
       const [
         studentsRes,
         coursesRes,
@@ -231,9 +255,16 @@ export default function Dashboard({ onNavigate, showToast }) {
         gradesRes,
         weeklyRes,
       ] = await Promise.all([
-        supabase.from('students').select('id, name, course, avg, status'),
-        supabase.from('courses').select('id, code, name, status'),
-        supabase.from('annual_plans').select('id, course, year'),
+        // Prefer explicit per-user scoping for non-privileged roles.
+        (user && !privileged)
+          ? supabase.from('students').select('id, name, course, avg, status, user_id').eq('user_id', user.id)
+          : supabase.from('students').select('id, name, course, avg, status'),
+        (user && !privileged)
+          ? supabase.from('courses').select('id, code, name, status, user_id').eq('user_id', user.id)
+          : supabase.from('courses').select('id, code, name, status'),
+        (user && !privileged)
+          ? supabase.from('annual_plans').select('id, course, year, user_id').eq('user_id', user.id)
+          : supabase.from('annual_plans').select('id, course, year'),
         supabase.from('ra_items').select('id, plan_id, status'),
         user
           ? supabase.from('grades').select('course, period, student_name, grade, weight').eq('user_id', user.id)
@@ -243,16 +274,28 @@ export default function Dashboard({ onNavigate, showToast }) {
           : Promise.resolve({ data: [], error: null }),
       ])
 
-      if (studentsRes.error) throw studentsRes.error
-      if (coursesRes.error) throw coursesRes.error
-      if (plansRes.error) throw plansRes.error
+      // Backward compatibility: if the schema doesn't have user_id yet, avoid leaking global demo data
+      // to docentes by falling back to empty lists for the scoped queries.
+      if (studentsRes.error) {
+        if (!(user && !privileged && isMissingColumn(studentsRes.error, 'user_id'))) throw studentsRes.error
+      }
+      if (coursesRes.error) {
+        if (!(user && !privileged && isMissingColumn(coursesRes.error, 'user_id'))) throw coursesRes.error
+      }
+      if (plansRes.error) {
+        if (user && !privileged && isMissingColumn(plansRes.error, 'user_id')) {
+          // We'll treat it as "no plans" for docentes if we can't scope safely.
+        } else {
+          throw plansRes.error
+        }
+      }
       if (raItemsRes.error) throw raItemsRes.error
       if (gradesRes.error) throw gradesRes.error
       if (weeklyRes.error) throw weeklyRes.error
 
-      const students = studentsRes.data || []
-      const courses = coursesRes.data || []
-      const plans = plansRes.data || []
+      const students = studentsRes.error ? [] : (studentsRes.data || [])
+      const courses = coursesRes.error ? [] : (coursesRes.data || [])
+      const plans = plansRes.error ? [] : (plansRes.data || [])
       const raItems = raItemsRes.data || []
       const grades = gradesRes.data || []
       const weeklyRows = weeklyRes.data || []
@@ -270,9 +313,11 @@ export default function Dashboard({ onNavigate, showToast }) {
         : plans
 
       const planIdSet = new Set(filteredPlans.map((plan) => plan.id))
+      // Important: if the user has no annual plans, we must NOT show global RA items.
+      // RA items are meaningful only when they belong to a plan the user can see.
       const filteredRaItems = planIdSet.size
         ? raItems.filter((item) => planIdSet.has(item.plan_id))
-        : raItems
+        : []
 
       const performanceData = buildCoursePerformance(grades, students)
       const alertData = buildAlerts(grades, students)
